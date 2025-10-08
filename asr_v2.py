@@ -1,14 +1,15 @@
 import asyncio
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, Optional, Set
-
 import json
+import os
+from typing import Dict, Optional, Set
+from contextlib import asynccontextmanager
 
+import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
-import numpy as np
 
 from intent_detector import IntentAnalyzer
 
@@ -173,6 +174,33 @@ ACCUM_BYTES_TARGET = SAMPLE_RATE * BYTES_PER_SAMPLE * ACCUM_MS // 1000
 model = WhisperModel("tiny", device="cpu")
 # model = WhisperModel(model_size, device="cpu")
 
+ASR_BACKEND = os.getenv("ASR_BACKEND", "whisper").strip().lower()
+qwen_transcriber = None
+if ASR_BACKEND == "qwen":
+    try:
+        from qwen_asr import QwenConfig, QwenTranscriber
+
+        qwen_model_path = os.getenv("QWEN_MODEL_PATH")
+        if qwen_model_path:
+            cfg = QwenConfig(model_id=qwen_model_path)
+        else:
+            cfg = QwenConfig()
+        dtype = os.getenv("QWEN_TORCH_DTYPE")
+        if dtype:
+            cfg.torch_dtype = dtype
+        device_override = os.getenv("QWEN_DEVICE")
+        if device_override:
+            cfg.device = device_override
+        qwen_transcriber = QwenTranscriber(cfg)
+        print("ASR backend: Qwen-3-ASR")
+    except Exception as exc:  # pragma: no cover - runtime path
+        qwen_transcriber = None
+        ASR_BACKEND = "whisper"
+        print(f"Qwen backend unavailable, falling back to Whisper: {exc}")
+        print("ASR backend: Whisper")
+else:
+    print("ASR backend: Whisper")
+
 
 @dataclass
 class TranscriptionJob:
@@ -183,11 +211,16 @@ class TranscriptionJob:
 
 AUDIO_QUEUE_MAXSIZE = 8
 TRANSCRIPTION_WORKERS = 1
-audio_queue: "asyncio.Queue[TranscriptionJob]" = asyncio.Queue(maxsize=AUDIO_QUEUE_MAXSIZE)
+audio_queue: "asyncio.Queue[TranscriptionJob]" = asyncio.Queue(
+    maxsize=AUDIO_QUEUE_MAXSIZE
+)
 worker_tasks: list[asyncio.Task] = []
 
 
 def _transcribe_blocking(audio: np.ndarray, language: str) -> str:
+    if qwen_transcriber:
+        return qwen_transcriber.transcribe(audio, language=language)
+
     segments, _info = model.transcribe(
         audio,
         language=language,
@@ -218,18 +251,21 @@ async def transcription_worker() -> None:
             audio_queue.task_done()
 
 
-@app.on_event("startup")
-async def start_workers() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     for _ in range(TRANSCRIPTION_WORKERS):
         worker_tasks.append(asyncio.create_task(transcription_worker()))
+    try:
+        yield
+    finally:
+        for task in worker_tasks:
+            task.cancel()
+        if worker_tasks:
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+        worker_tasks.clear()
 
 
-@app.on_event("shutdown")
-async def stop_workers() -> None:
-    for task in worker_tasks:
-        task.cancel()
-    if worker_tasks:
-        await asyncio.gather(*worker_tasks, return_exceptions=True)
+app.router.lifespan_context = lifespan
 
 
 @app.websocket("/asr")
