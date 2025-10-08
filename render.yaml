@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: whisp-asr
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    numInstances: 1
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+    healthCheckPath: /
+    autoDeploy: true
