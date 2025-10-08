@@ -1,13 +1,14 @@
 import asyncio
 from collections import defaultdict
-from typing import Dict, Set, Optional
+from dataclasses import dataclass
+from typing import Dict, Optional, Set
 
+import json
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 import numpy as np
-import json
 
 from intent_detector import IntentAnalyzer
 
@@ -173,6 +174,64 @@ model = WhisperModel("tiny", device="cpu")
 # model = WhisperModel(model_size, device="cpu")
 
 
+@dataclass
+class TranscriptionJob:
+    audio: np.ndarray
+    language: str
+    future: asyncio.Future
+
+
+AUDIO_QUEUE_MAXSIZE = 8
+TRANSCRIPTION_WORKERS = 1
+audio_queue: "asyncio.Queue[TranscriptionJob]" = asyncio.Queue(maxsize=AUDIO_QUEUE_MAXSIZE)
+worker_tasks: list[asyncio.Task] = []
+
+
+def _transcribe_blocking(audio: np.ndarray, language: str) -> str:
+    segments, _info = model.transcribe(
+        audio,
+        language=language,
+        vad_filter=True,
+        beam_size=1,
+        condition_on_previous_text=False,
+    )
+    return "".join(s.text for s in segments).strip()
+
+
+async def transcription_worker() -> None:
+    loop = asyncio.get_running_loop()
+    while True:
+        job = await audio_queue.get()
+        if job.future.cancelled():
+            audio_queue.task_done()
+            continue
+        try:
+            text = await loop.run_in_executor(
+                None, _transcribe_blocking, job.audio, job.language
+            )
+            if not job.future.cancelled():
+                job.future.set_result(text)
+        except Exception as exc:
+            if not job.future.cancelled():
+                job.future.set_exception(exc)
+        finally:
+            audio_queue.task_done()
+
+
+@app.on_event("startup")
+async def start_workers() -> None:
+    for _ in range(TRANSCRIPTION_WORKERS):
+        worker_tasks.append(asyncio.create_task(transcription_worker()))
+
+
+@app.on_event("shutdown")
+async def stop_workers() -> None:
+    for task in worker_tasks:
+        task.cancel()
+    if worker_tasks:
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
+
+
 @app.websocket("/asr")
 async def asr_ws(ws: WebSocket):
     await ws.accept()
@@ -198,6 +257,33 @@ async def asr_ws(ws: WebSocket):
             await ws.close(code=1002)
             return
 
+        loop = asyncio.get_running_loop()
+
+        async def handle_transcription_result(fut: asyncio.Future) -> None:
+            try:
+                text = await fut
+            except Exception as exc:
+                try:
+                    await ws.send_json({"type": "error", "message": str(exc)})
+                except Exception:
+                    pass
+                return
+            if not text:
+                return
+            try:
+                await broadcast(
+                    room_id, None, {"type": "caption", "text": text, "role": role}
+                )
+                if role == "customer":
+                    asyncio.create_task(
+                        analyze_and_broadcast_intent(room_id, role, text)
+                    )
+            except Exception as exc:
+                try:
+                    await ws.send_json({"type": "error", "message": str(exc)})
+                except Exception:
+                    pass
+
         while True:
             pkt = await ws.receive_bytes()
             buffer.extend(pkt)
@@ -212,22 +298,10 @@ async def asr_ws(ws: WebSocket):
                     continue
                 audio = pcm16.astype(np.float32) / 32768.0
 
-                segments, _info = model.transcribe(
-                    audio,
-                    language=language,
-                    vad_filter=True,
-                    beam_size=1,
-                    condition_on_previous_text=False,
-                )
-                text = "".join(s.text for s in segments).strip()
-                if text and room_id:
-                    await broadcast(
-                        room_id, None, {"type": "caption", "text": text, "role": role}
-                    )
-                    if role == "customer":
-                        asyncio.create_task(
-                            analyze_and_broadcast_intent(room_id, role, text)
-                        )
+                future: asyncio.Future = loop.create_future()
+                job = TranscriptionJob(audio=audio, language=language, future=future)
+                await audio_queue.put(job)
+                asyncio.create_task(handle_transcription_result(future))
     except WebSocketDisconnect:
         pass
     except Exception as e:
