@@ -15,7 +15,7 @@ app.add_middleware(
 
 # Load a small model to keep it snappy on CPU. You can switch "tiny" -> "base".
 # First run will download the model to ~/.cache
-model = WhisperModel("base", device="cpu")  # use "tiny" for even lighter
+model = WhisperModel("tiny", device="cpu")  # use "tiny" for even lighter
 
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2  # int16

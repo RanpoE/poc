@@ -169,7 +169,7 @@ ACCUM_BYTES_TARGET = SAMPLE_RATE * BYTES_PER_SAMPLE * ACCUM_MS // 1000
 # model_size = "large-v2"
 # device = "gpu"
 
-model = WhisperModel("base", device="cpu")
+model = WhisperModel("tiny", device="cpu")
 # model = WhisperModel(model_size, device="cpu")
 
 
