@@ -1,9 +1,9 @@
 services:
   - type: web
     name: whisp-asr
-    env: docker
     dockerfilePath: ./Dockerfile
-    plan: starter
+    runtime: python
+    plan: free
     numInstances: 1
     envVars:
       - key: ANTHROPIC_API_KEY
